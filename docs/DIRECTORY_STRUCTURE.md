@@ -25,11 +25,13 @@ tinytcp/
 ## 各ディレクトリの役割
 
 ### `/cmd`
+
 - アプリケーションのメインパッケージ
-- `tinytcp-server`: テスト用のTCPサーバー実装
-- `tinytcp-client`: テスト用のTCPクライアント実装
+- `tinytcp-server`: テスト用の TCP サーバー実装
+- `tinytcp-client`: テスト用の TCP クライアント実装
 
 ### `/internal`
+
 - プライベートなアプリケーションとライブラリのコード
 - 他のアプリケーションやライブラリからインポートされたくないコード
 - `/internal/tcp`: TCP プロトコルのコア実装
@@ -37,14 +39,17 @@ tinytcp/
 - `/internal/packet`: パケット構造とヘッダ処理
 
 ### `/pkg`
+
 - 外部アプリケーションで使用されることを意図したライブラリコード
 - `/pkg/tinytcp`: 公開 API とインターフェース
 
 ### その他
+
 - `/test`: 追加のテストアプリケーションとテストデータ
 - `/docs`: 詳細なドキュメント
 - `/examples`: 使用例とサンプルコード
 
 この構造は以下の Go プロジェクトレイアウト標準に従っています：
+
 - [Standard Go Project Layout](https://github.com/golang-standards/project-layout)
 - Kubernetes, Docker, Prometheus などの大規模 OSS プロジェクトで採用されているパターン
