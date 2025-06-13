@@ -180,3 +180,108 @@ func (tcb *TCB) String() string {
 	return fmt.Sprintf("TCB[%s -> %s, State: %s, SendNext: %d, RecvNext: %d]",
 		tcb.LocalAddr, tcb.RemoteAddr, tcb.State.String(), tcb.SendNext, tcb.RecvNext)
 }
+
+// DataTransfer handles data transmission and reception
+type DataTransfer struct {
+	tcb *TCB
+}
+
+// NewDataTransfer creates a new data transfer handler
+func NewDataTransfer(tcb *TCB) *DataTransfer {
+	return &DataTransfer{tcb: tcb}
+}
+
+// Send sends data and returns a TCP packet with the data
+func (dt *DataTransfer) Send(data []byte) (*packet.TCPHeader, error) {
+	if dt.tcb.State != socket.StateEstablished {
+		return nil, fmt.Errorf("connection must be in ESTABLISHED state to send data")
+	}
+
+	if len(data) == 0 {
+		return nil, fmt.Errorf("cannot send empty data")
+	}
+
+	// Create data packet
+	header := packet.NewTCPHeader(
+		uint16(dt.tcb.LocalAddr.Port),
+		uint16(dt.tcb.RemoteAddr.Port),
+	)
+	
+	header.SequenceNumber = dt.tcb.SendNext
+	header.AckNumber = dt.tcb.RecvNext
+	header.SetFlag(packet.FlagACK | packet.FlagPSH) // ACK + PSH for data
+	header.WindowSize = dt.tcb.RecvWindow
+
+	// データを送信バッファに追加（学習目的のためシンプルに）
+	dt.tcb.SendBuffer = append(dt.tcb.SendBuffer, data...)
+
+	// シーケンス番号を更新（送信データ長分進める）
+	dt.tcb.SendNext += uint32(len(data))
+
+	return header, nil
+}
+
+// Receive processes incoming data packet and returns received data
+func (dt *DataTransfer) Receive(header *packet.TCPHeader, data []byte) ([]byte, *packet.TCPHeader, error) {
+	if dt.tcb.State != socket.StateEstablished {
+		return nil, nil, fmt.Errorf("connection must be in ESTABLISHED state to receive data")
+	}
+
+	// シーケンス番号の検証
+	if header.SequenceNumber != dt.tcb.RecvNext {
+		return nil, nil, fmt.Errorf("out-of-order packet: expected seq %d, got %d", 
+			dt.tcb.RecvNext, header.SequenceNumber)
+	}
+
+	// データを受信バッファに追加
+	dt.tcb.RecvBuffer = append(dt.tcb.RecvBuffer, data...)
+	
+	// 受信シーケンス番号を更新
+	dt.tcb.RecvNext += uint32(len(data))
+
+	// ACKパケットを作成
+	ackHeader := packet.NewTCPHeader(
+		uint16(dt.tcb.LocalAddr.Port),
+		uint16(dt.tcb.RemoteAddr.Port),
+	)
+	
+	ackHeader.SequenceNumber = dt.tcb.SendNext
+	ackHeader.AckNumber = dt.tcb.RecvNext // 更新された受信シーケンス番号
+	ackHeader.SetFlag(packet.FlagACK)
+	ackHeader.WindowSize = dt.tcb.RecvWindow
+
+	return data, ackHeader, nil
+}
+
+// ReceiveAck processes incoming ACK packet for sent data
+func (dt *DataTransfer) ReceiveAck(header *packet.TCPHeader) error {
+	if dt.tcb.State != socket.StateEstablished {
+		return fmt.Errorf("connection must be in ESTABLISHED state to process ACK")
+	}
+
+	// ACK番号の検証
+	if header.AckNumber < dt.tcb.SendUnack || header.AckNumber > dt.tcb.SendNext {
+		return fmt.Errorf("invalid ACK number: %d (expected between %d and %d)", 
+			header.AckNumber, dt.tcb.SendUnack, dt.tcb.SendNext)
+	}
+
+	// 確認済みデータの更新
+	dt.tcb.SendUnack = header.AckNumber
+
+	return nil
+}
+
+// GetSendBuffer returns a copy of the send buffer
+func (dt *DataTransfer) GetSendBuffer() []byte {
+	return append([]byte(nil), dt.tcb.SendBuffer...)
+}
+
+// GetReceiveBuffer returns a copy of the receive buffer
+func (dt *DataTransfer) GetReceiveBuffer() []byte {
+	return append([]byte(nil), dt.tcb.RecvBuffer...)
+}
+
+// ClearReceiveBuffer clears the receive buffer (after application reads data)
+func (dt *DataTransfer) ClearReceiveBuffer() {
+	dt.tcb.RecvBuffer = dt.tcb.RecvBuffer[:0]
+}
