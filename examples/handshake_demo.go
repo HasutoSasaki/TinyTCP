@@ -10,7 +10,7 @@ import (
 	"github.com/sasakihasuto/tinytcp/internal/tcp"
 )
 
-func main() {
+func runHandshakeDemo() {
 	fmt.Println("=== TinyTCP 3-Way Handshake Demo ===")
 
 	// Setup addresses
