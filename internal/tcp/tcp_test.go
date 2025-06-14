@@ -93,7 +93,7 @@ func TestThreeWayHandshake_Complete(t *testing.T) {
 		t.Error("SYN-ACK packet should have ACK flag set")
 	}
 	if synAckPacket.AckNumber != synPacket.SequenceNumber+1 {
-		t.Errorf("Expected ACK number %d, got %d", 
+		t.Errorf("Expected ACK number %d, got %d",
 			synPacket.SequenceNumber+1, synAckPacket.AckNumber)
 	}
 
@@ -114,7 +114,7 @@ func TestThreeWayHandshake_Complete(t *testing.T) {
 		t.Error("ACK packet should have ACK flag set")
 	}
 	if ackPacket.AckNumber != synAckPacket.SequenceNumber+1 {
-		t.Errorf("Expected ACK number %d, got %d", 
+		t.Errorf("Expected ACK number %d, got %d",
 			synAckPacket.SequenceNumber+1, ackPacket.AckNumber)
 	}
 
@@ -307,7 +307,7 @@ func TestDataTransfer_InvalidStates(t *testing.T) {
 
 	tcb := NewTCB(localAddr, remoteAddr)
 	tcb.State = socket.StateClosed // Invalid state
-	
+
 	dt := NewDataTransfer(tcb)
 
 	// 非ESTABLISHED状態でのSendテスト
@@ -337,7 +337,7 @@ func TestDataTransfer_OutOfOrderPacket(t *testing.T) {
 	// 順序が異なるパケット
 	outOfOrderHeader := packet.NewTCPHeader(9090, 8080)
 	outOfOrderHeader.SequenceNumber = 2050 // 期待より大きい
-	
+
 	_, _, err := dt.Receive(outOfOrderHeader, []byte("out of order"))
 	if err == nil {
 		t.Error("Expected error for out-of-order packet")
@@ -403,4 +403,269 @@ func TestDataTransfer_CompleteExchange(t *testing.T) {
 	t.Logf("Data exchange completed successfully!")
 	t.Logf("Sent data: %q", string(testData))
 	t.Logf("Received data: %q", string(receivedData))
+}
+
+func TestFourWayHandshake_ActiveClose(t *testing.T) {
+	// Setup addresses
+	clientAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:8080")
+	serverAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:9090")
+
+	// Create TCBs in ESTABLISHED state
+	clientTCB := NewTCB(clientAddr, serverAddr)
+	serverTCB := NewTCB(serverAddr, clientAddr)
+
+	clientTCB.State = socket.StateEstablished
+	serverTCB.State = socket.StateEstablished
+	clientTCB.SendNext = 1000
+	clientTCB.RecvNext = 2000
+	serverTCB.SendNext = 2000
+	serverTCB.RecvNext = 1000
+
+	// Create handshake handlers
+	clientHandshake := NewFourWayHandshake(clientTCB)
+	serverHandshake := NewFourWayHandshake(serverTCB)
+
+	// Step 1: Client initiates close (sends FIN)
+	finPacket1, err := clientHandshake.Close()
+	if err != nil {
+		t.Fatalf("Failed to initiate close: %v", err)
+	}
+
+	// Verify client state and FIN packet
+	if clientTCB.State != socket.StateFinWait1 {
+		t.Errorf("Expected client state FIN_WAIT_1, got %s", clientTCB.State.String())
+	}
+	if !finPacket1.HasFlag(packet.FlagFIN) {
+		t.Error("First FIN packet should have FIN flag set")
+	}
+	if !finPacket1.HasFlag(packet.FlagACK) {
+		t.Error("First FIN packet should have ACK flag set")
+	}
+
+	// Step 2: Server handles FIN and sends ACK
+	ackPacket1, err := serverHandshake.HandleFin(finPacket1)
+	if err != nil {
+		t.Fatalf("Failed to handle FIN: %v", err)
+	}
+
+	// Verify server state and ACK packet
+	if serverTCB.State != socket.StateCloseWait {
+		t.Errorf("Expected server state CLOSE_WAIT, got %s", serverTCB.State.String())
+	}
+	if !ackPacket1.HasFlag(packet.FlagACK) {
+		t.Error("ACK packet should have ACK flag set")
+	}
+	if ackPacket1.AckNumber != finPacket1.SequenceNumber+1 {
+		t.Errorf("Expected ACK number %d, got %d",
+			finPacket1.SequenceNumber+1, ackPacket1.AckNumber)
+	}
+
+	// Step 3: Client handles ACK for its FIN
+	err = clientHandshake.HandleFinAck(ackPacket1)
+	if err != nil {
+		t.Fatalf("Failed to handle FIN ACK: %v", err)
+	}
+
+	// Verify client state transition
+	if clientTCB.State != socket.StateFinWait2 {
+		t.Errorf("Expected client state FIN_WAIT_2, got %s", clientTCB.State.String())
+	}
+
+	// Step 4: Server closes from CLOSE_WAIT (sends FIN)
+	finPacket2, err := serverHandshake.CloseFromCloseWait()
+	if err != nil {
+		t.Fatalf("Failed to close from CLOSE_WAIT: %v", err)
+	}
+
+	// Verify server state and second FIN packet
+	if serverTCB.State != socket.StateLastAck {
+		t.Errorf("Expected server state LAST_ACK, got %s", serverTCB.State.String())
+	}
+	if !finPacket2.HasFlag(packet.FlagFIN) {
+		t.Error("Second FIN packet should have FIN flag set")
+	}
+
+	// Step 5: Client handles server's FIN and sends final ACK
+	ackPacket2, err := clientHandshake.HandleFin(finPacket2)
+	if err != nil {
+		t.Fatalf("Failed to handle server FIN: %v", err)
+	}
+
+	// Verify client state
+	if clientTCB.State != socket.StateTimeWait {
+		t.Errorf("Expected client state TIME_WAIT, got %s", clientTCB.State.String())
+	}
+	if !ackPacket2.HasFlag(packet.FlagACK) {
+		t.Error("Final ACK packet should have ACK flag set")
+	}
+
+	// Step 6: Server handles final ACK
+	err = serverHandshake.HandleFinAck(ackPacket2)
+	if err != nil {
+		t.Fatalf("Failed to handle final ACK: %v", err)
+	}
+
+	// Verify server final state
+	if serverTCB.State != socket.StateClosed {
+		t.Errorf("Expected server state CLOSED, got %s", serverTCB.State.String())
+	}
+
+	t.Logf("Active close handshake completed successfully!")
+	t.Logf("Final client state: %s", clientTCB.State.String())
+	t.Logf("Final server state: %s", serverTCB.State.String())
+}
+
+func TestFourWayHandshake_SimultaneousClose(t *testing.T) {
+	// Setup addresses
+	clientAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:8080")
+	serverAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:9090")
+
+	// Create TCBs in ESTABLISHED state
+	clientTCB := NewTCB(clientAddr, serverAddr)
+	serverTCB := NewTCB(serverAddr, clientAddr)
+
+	clientTCB.State = socket.StateEstablished
+	serverTCB.State = socket.StateEstablished
+	clientTCB.SendNext = 1000
+	clientTCB.RecvNext = 2000
+	serverTCB.SendNext = 2000
+	serverTCB.RecvNext = 1000
+
+	// Create handshake handlers
+	clientHandshake := NewFourWayHandshake(clientTCB)
+	serverHandshake := NewFourWayHandshake(serverTCB)
+
+	// Step 1: Both sides initiate close simultaneously
+	clientFinPacket, err := clientHandshake.Close()
+	if err != nil {
+		t.Fatalf("Failed to initiate client close: %v", err)
+	}
+
+	serverFinPacket, err := serverHandshake.Close()
+	if err != nil {
+		t.Fatalf("Failed to initiate server close: %v", err)
+	}
+
+	// Both should be in FIN_WAIT_1 state
+	if clientTCB.State != socket.StateFinWait1 {
+		t.Errorf("Expected client state FIN_WAIT_1, got %s", clientTCB.State.String())
+	}
+	if serverTCB.State != socket.StateFinWait1 {
+		t.Errorf("Expected server state FIN_WAIT_1, got %s", serverTCB.State.String())
+	}
+
+	// Step 2: Each side handles the other's FIN
+	clientAckPacket, err := clientHandshake.HandleFin(serverFinPacket)
+	if err != nil {
+		t.Fatalf("Failed to handle server FIN: %v", err)
+	}
+
+	serverAckPacket, err := serverHandshake.HandleFin(clientFinPacket)
+	if err != nil {
+		t.Fatalf("Failed to handle client FIN: %v", err)
+	}
+
+	// Both should now be in CLOSING state
+	if clientTCB.State != socket.StateClosing {
+		t.Errorf("Expected client state CLOSING, got %s", clientTCB.State.String())
+	}
+	if serverTCB.State != socket.StateClosing {
+		t.Errorf("Expected server state CLOSING, got %s", serverTCB.State.String())
+	}
+
+	// Step 3: Each side handles the ACK for their FIN
+	err = clientHandshake.HandleFinAck(serverAckPacket)
+	if err != nil {
+		t.Fatalf("Failed to handle server ACK: %v", err)
+	}
+
+	err = serverHandshake.HandleFinAck(clientAckPacket)
+	if err != nil {
+		t.Fatalf("Failed to handle client ACK: %v", err)
+	}
+
+	// Both should now be in TIME_WAIT state
+	if clientTCB.State != socket.StateTimeWait {
+		t.Errorf("Expected client state TIME_WAIT, got %s", clientTCB.State.String())
+	}
+	if serverTCB.State != socket.StateTimeWait {
+		t.Errorf("Expected server state TIME_WAIT, got %s", serverTCB.State.String())
+	}
+
+	t.Logf("Simultaneous close handshake completed successfully!")
+}
+
+func TestFourWayHandshake_InvalidStates(t *testing.T) {
+	localAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:8080")
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:9090")
+
+	tcb := NewTCB(localAddr, remoteAddr)
+	handshake := NewFourWayHandshake(tcb)
+
+	// Test Close from invalid state
+	tcb.State = socket.StateClosed
+	_, err := handshake.Close()
+	if err == nil {
+		t.Error("Expected error when closing from CLOSED state")
+	}
+
+	// Test HandleFin from invalid state
+	tcb.State = socket.StateClosed
+	finHeader := packet.NewTCPHeader(9090, 8080)
+	finHeader.SetFlag(packet.FlagFIN)
+	_, err = handshake.HandleFin(finHeader)
+	if err == nil {
+		t.Error("Expected error when handling FIN from CLOSED state")
+	}
+
+	// Test CloseFromCloseWait from invalid state
+	tcb.State = socket.StateEstablished
+	_, err = handshake.CloseFromCloseWait()
+	if err == nil {
+		t.Error("Expected error when calling CloseFromCloseWait from ESTABLISHED state")
+	}
+}
+
+func TestFourWayHandshake_ConnectionState(t *testing.T) {
+	localAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:8080")
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:9090")
+
+	tcb := NewTCB(localAddr, remoteAddr)
+	handshake := NewFourWayHandshake(tcb)
+
+	// Test different states
+	testStates := []struct {
+		state      socket.SocketState
+		canSend    bool
+		canReceive bool
+		isClosed   bool
+	}{
+		{socket.StateEstablished, true, true, false},
+		{socket.StateFinWait1, false, false, false},
+		{socket.StateFinWait2, false, false, false},
+		{socket.StateCloseWait, false, true, false},
+		{socket.StateClosing, false, false, false},
+		{socket.StateLastAck, false, false, false},
+		{socket.StateTimeWait, false, false, false},
+		{socket.StateClosed, false, false, true},
+	}
+
+	for _, test := range testStates {
+		tcb.State = test.state
+
+		if handshake.CanSendData() != test.canSend {
+			t.Errorf("State %s: expected CanSendData=%v, got %v",
+				test.state.String(), test.canSend, handshake.CanSendData())
+		}
+
+		if handshake.CanReceiveData() != test.canReceive {
+			t.Errorf("State %s: expected CanReceiveData=%v, got %v",
+				test.state.String(), test.canReceive, handshake.CanReceiveData())
+		}
+
+		if handshake.IsConnectionClosed() != test.isClosed {
+			t.Errorf("State %s: expected IsConnectionClosed=%v, got %v",
+				test.state.String(), test.isClosed, handshake.IsConnectionClosed())
+		}
+	}
 }

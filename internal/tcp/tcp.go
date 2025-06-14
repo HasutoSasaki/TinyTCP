@@ -18,10 +18,10 @@ type TCB struct {
 	RemoteAddr *net.TCPAddr
 
 	// Sequence numbers
-	SendNext    uint32 // 次に送信するシーケンス番号
-	SendUnack   uint32 // 未確認の最古のシーケンス番号
-	RecvNext    uint32 // 次に受信を期待するシーケンス番号
-	RecvWindow  uint16 // 受信ウィンドウサイズ
+	SendNext   uint32 // 次に送信するシーケンス番号
+	SendUnack  uint32 // 未確認の最古のシーケンス番号
+	RecvNext   uint32 // 次に受信を期待するシーケンス番号
+	RecvWindow uint16 // 受信ウィンドウサイズ
 
 	// State
 	State socket.SocketState
@@ -206,7 +206,7 @@ func (dt *DataTransfer) Send(data []byte) (*packet.TCPHeader, error) {
 		uint16(dt.tcb.LocalAddr.Port),
 		uint16(dt.tcb.RemoteAddr.Port),
 	)
-	
+
 	header.SequenceNumber = dt.tcb.SendNext
 	header.AckNumber = dt.tcb.RecvNext
 	header.SetFlag(packet.FlagACK | packet.FlagPSH) // ACK + PSH for data
@@ -229,13 +229,13 @@ func (dt *DataTransfer) Receive(header *packet.TCPHeader, data []byte) ([]byte, 
 
 	// シーケンス番号の検証
 	if header.SequenceNumber != dt.tcb.RecvNext {
-		return nil, nil, fmt.Errorf("out-of-order packet: expected seq %d, got %d", 
+		return nil, nil, fmt.Errorf("out-of-order packet: expected seq %d, got %d",
 			dt.tcb.RecvNext, header.SequenceNumber)
 	}
 
 	// データを受信バッファに追加
 	dt.tcb.RecvBuffer = append(dt.tcb.RecvBuffer, data...)
-	
+
 	// 受信シーケンス番号を更新
 	dt.tcb.RecvNext += uint32(len(data))
 
@@ -244,7 +244,7 @@ func (dt *DataTransfer) Receive(header *packet.TCPHeader, data []byte) ([]byte, 
 		uint16(dt.tcb.LocalAddr.Port),
 		uint16(dt.tcb.RemoteAddr.Port),
 	)
-	
+
 	ackHeader.SequenceNumber = dt.tcb.SendNext
 	ackHeader.AckNumber = dt.tcb.RecvNext // 更新された受信シーケンス番号
 	ackHeader.SetFlag(packet.FlagACK)
@@ -261,7 +261,7 @@ func (dt *DataTransfer) ReceiveAck(header *packet.TCPHeader) error {
 
 	// ACK番号の検証
 	if header.AckNumber < dt.tcb.SendUnack || header.AckNumber > dt.tcb.SendNext {
-		return fmt.Errorf("invalid ACK number: %d (expected between %d and %d)", 
+		return fmt.Errorf("invalid ACK number: %d (expected between %d and %d)",
 			header.AckNumber, dt.tcb.SendUnack, dt.tcb.SendNext)
 	}
 
@@ -284,4 +284,151 @@ func (dt *DataTransfer) GetReceiveBuffer() []byte {
 // ClearReceiveBuffer clears the receive buffer (after application reads data)
 func (dt *DataTransfer) ClearReceiveBuffer() {
 	dt.tcb.RecvBuffer = dt.tcb.RecvBuffer[:0]
+}
+
+// FourWayHandshake handles the TCP four-way handshake process for connection termination
+type FourWayHandshake struct {
+	tcb *TCB
+}
+
+// NewFourWayHandshake creates a new four-way handshake handler
+func NewFourWayHandshake(tcb *TCB) *FourWayHandshake {
+	return &FourWayHandshake{tcb: tcb}
+}
+
+// Close initiates connection termination (sends FIN)
+func (h *FourWayHandshake) Close() (*packet.TCPHeader, error) {
+	if h.tcb.State != socket.StateEstablished {
+		return nil, fmt.Errorf("connection must be in ESTABLISHED state to close")
+	}
+
+	// Create FIN packet
+	finHeader := packet.NewTCPHeader(
+		uint16(h.tcb.LocalAddr.Port),
+		uint16(h.tcb.RemoteAddr.Port),
+	)
+	finHeader.SequenceNumber = h.tcb.SendNext
+	finHeader.AckNumber = h.tcb.RecvNext
+	finHeader.SetFlag(packet.FlagFIN | packet.FlagACK)
+	finHeader.WindowSize = h.tcb.RecvWindow
+
+	// Update sequence number (FIN consumes one sequence number)
+	h.tcb.SendNext++
+
+	// Transition to FIN_WAIT_1 state
+	h.tcb.State = socket.StateFinWait1
+
+	return finHeader, nil
+}
+
+// HandleFin handles incoming FIN packet (passive close)
+func (h *FourWayHandshake) HandleFin(finHeader *packet.TCPHeader) (*packet.TCPHeader, error) {
+	if h.tcb.State != socket.StateEstablished && h.tcb.State != socket.StateFinWait1 && h.tcb.State != socket.StateFinWait2 {
+		return nil, fmt.Errorf("unexpected FIN in state %s", h.tcb.State.String())
+	}
+
+	// Verify sequence number
+	if finHeader.SequenceNumber != h.tcb.RecvNext {
+		return nil, fmt.Errorf("unexpected sequence number in FIN: expected %d, got %d",
+			h.tcb.RecvNext, finHeader.SequenceNumber)
+	}
+
+	// Update receive sequence number (FIN consumes one sequence number)
+	h.tcb.RecvNext++
+
+	// Create ACK for FIN
+	ackHeader := packet.NewTCPHeader(
+		uint16(h.tcb.LocalAddr.Port),
+		uint16(h.tcb.RemoteAddr.Port),
+	)
+	ackHeader.SequenceNumber = h.tcb.SendNext
+	ackHeader.AckNumber = h.tcb.RecvNext
+	ackHeader.SetFlag(packet.FlagACK)
+	ackHeader.WindowSize = h.tcb.RecvWindow
+
+	// State transition depends on current state
+	switch h.tcb.State {
+	case socket.StateEstablished:
+		// Passive close: ESTABLISHED -> CLOSE_WAIT
+		h.tcb.State = socket.StateCloseWait
+	case socket.StateFinWait1:
+		// Simultaneous close: FIN_WAIT_1 -> CLOSING
+		h.tcb.State = socket.StateClosing
+	case socket.StateFinWait2:
+		// Normal close completion: FIN_WAIT_2 -> TIME_WAIT
+		h.tcb.State = socket.StateTimeWait
+	}
+
+	return ackHeader, nil
+}
+
+// HandleFinAck handles ACK for our FIN packet
+func (h *FourWayHandshake) HandleFinAck(ackHeader *packet.TCPHeader) error {
+	if h.tcb.State != socket.StateFinWait1 && h.tcb.State != socket.StateClosing && h.tcb.State != socket.StateLastAck {
+		return fmt.Errorf("unexpected FIN ACK in state %s", h.tcb.State.String())
+	}
+
+	// Verify ACK number (should acknowledge our FIN)
+	if ackHeader.AckNumber != h.tcb.SendNext {
+		return fmt.Errorf("invalid ACK number for FIN: expected %d, got %d",
+			h.tcb.SendNext, ackHeader.AckNumber)
+	}
+
+	// Update unacknowledged sequence number
+	h.tcb.SendUnack = ackHeader.AckNumber
+
+	// State transition depends on current state
+	switch h.tcb.State {
+	case socket.StateFinWait1:
+		// FIN_WAIT_1 -> FIN_WAIT_2 (our FIN acknowledged, waiting for their FIN)
+		h.tcb.State = socket.StateFinWait2
+	case socket.StateClosing:
+		// CLOSING -> TIME_WAIT (both FINs sent and acknowledged)
+		h.tcb.State = socket.StateTimeWait
+	case socket.StateLastAck:
+		// LAST_ACK -> CLOSED (final ACK received)
+		h.tcb.State = socket.StateClosed
+	}
+
+	return nil
+}
+
+// CloseFromCloseWait completes passive close from CLOSE_WAIT state
+func (h *FourWayHandshake) CloseFromCloseWait() (*packet.TCPHeader, error) {
+	if h.tcb.State != socket.StateCloseWait {
+		return nil, fmt.Errorf("connection must be in CLOSE_WAIT state")
+	}
+
+	// Create FIN packet for final close
+	finHeader := packet.NewTCPHeader(
+		uint16(h.tcb.LocalAddr.Port),
+		uint16(h.tcb.RemoteAddr.Port),
+	)
+	finHeader.SequenceNumber = h.tcb.SendNext
+	finHeader.AckNumber = h.tcb.RecvNext
+	finHeader.SetFlag(packet.FlagFIN | packet.FlagACK)
+	finHeader.WindowSize = h.tcb.RecvWindow
+
+	// Update sequence number (FIN consumes one sequence number)
+	h.tcb.SendNext++
+
+	// Transition to LAST_ACK state
+	h.tcb.State = socket.StateLastAck
+
+	return finHeader, nil
+}
+
+// IsConnectionClosed returns true if the connection is fully closed
+func (h *FourWayHandshake) IsConnectionClosed() bool {
+	return h.tcb.State == socket.StateClosed
+}
+
+// CanSendData returns true if the connection can still send data
+func (h *FourWayHandshake) CanSendData() bool {
+	return h.tcb.State == socket.StateEstablished
+}
+
+// CanReceiveData returns true if the connection can still receive data
+func (h *FourWayHandshake) CanReceiveData() bool {
+	return h.tcb.State == socket.StateEstablished || h.tcb.State == socket.StateCloseWait
 }
