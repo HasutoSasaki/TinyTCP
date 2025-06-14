@@ -5,23 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
 
 	"github.com/sasakihasuto/tinytcp/internal/socket"
 	"github.com/sasakihasuto/tinytcp/internal/tcp"
 )
 
 func main() {
-	// フェーズ2のデモ：3ウェイハンドシェイク
-	runHandshakeDemo()
-	
-	fmt.Println("\n" + strings.Repeat("=", 50) + "\n")
-	
-	// フェーズ3のデモ：データ送受信
-	runDataTransferDemo()
-}
-
-func runDataTransferDemo() {
 	fmt.Println("=== TCP データ送受信デモ ===")
 
 	// クライアントとサーバーのアドレス設定
@@ -34,13 +23,13 @@ func runDataTransferDemo() {
 
 	// コネクション確立（3ウェイハンドシェイク）をシミュレート
 	fmt.Println("\n--- 3ウェイハンドシェイク ---")
-	
+
 	clientHandshake := tcp.NewThreeWayHandshake(clientTCB)
 	serverHandshake := tcp.NewThreeWayHandshake(serverTCB)
 
 	// ハンドシェイクプロセス
 	serverTCB.SetState(socket.StateListen)
-	
+
 	// 1. SYN
 	synPacket, _ := clientHandshake.StartClient()
 	fmt.Printf("クライアント -> サーバー: %s\n", synPacket.String())
@@ -73,7 +62,7 @@ func runDataTransferDemo() {
 	if err != nil {
 		log.Fatalf("データ送信エラー: %v", err)
 	}
-	fmt.Printf("クライアント -> サーバー: %s (データ長: %d)\n", 
+	fmt.Printf("クライアント -> サーバー: %s (データ長: %d)\n",
 		dataPacket1.String(), len(clientData))
 
 	// Step 2: サーバーがデータを受信してACK送信
@@ -99,7 +88,7 @@ func runDataTransferDemo() {
 	if err != nil {
 		log.Fatalf("応答送信エラー: %v", err)
 	}
-	fmt.Printf("サーバー -> クライアント: %s (データ長: %d)\n", 
+	fmt.Printf("サーバー -> クライアント: %s (データ長: %d)\n",
 		dataPacket2.String(), len(serverData))
 
 	// Step 5: クライアントが応答を受信してACK送信

@@ -10,7 +10,7 @@ import (
 	"github.com/sasakihasuto/tinytcp/internal/tcp"
 )
 
-func runHandshakeDemo() {
+func main() {
 	fmt.Println("=== TinyTCP 3-Way Handshake Demo ===")
 
 	// Setup addresses
@@ -40,8 +40,8 @@ func runHandshakeDemo() {
 	if err != nil {
 		log.Fatalf("Failed to start client handshake: %v", err)
 	}
-	
-	fmt.Printf("  SYN packet: Seq=%d, Ack=%d, Flags=%s\n", 
+
+	fmt.Printf("  SYN packet: Seq=%d, Ack=%d, Flags=%s\n",
 		synPacket.SequenceNumber, synPacket.AckNumber, getFlagsString(synPacket))
 	fmt.Printf("  Client state: %s\n", clientTCB.GetState().String())
 	fmt.Println()
@@ -53,7 +53,7 @@ func runHandshakeDemo() {
 		log.Fatalf("Failed to handle SYN: %v", err)
 	}
 
-	fmt.Printf("  SYN-ACK packet: Seq=%d, Ack=%d, Flags=%s\n", 
+	fmt.Printf("  SYN-ACK packet: Seq=%d, Ack=%d, Flags=%s\n",
 		synAckPacket.SequenceNumber, synAckPacket.AckNumber, getFlagsString(synAckPacket))
 	fmt.Printf("  Server state: %s\n", serverTCB.GetState().String())
 	fmt.Println()
@@ -65,7 +65,7 @@ func runHandshakeDemo() {
 		log.Fatalf("Failed to handle SYN-ACK: %v", err)
 	}
 
-	fmt.Printf("  ACK packet: Seq=%d, Ack=%d, Flags=%s\n", 
+	fmt.Printf("  ACK packet: Seq=%d, Ack=%d, Flags=%s\n",
 		ackPacket.SequenceNumber, ackPacket.AckNumber, getFlagsString(ackPacket))
 	fmt.Printf("  Client state: %s\n", clientTCB.GetState().String())
 	fmt.Println()
@@ -89,7 +89,7 @@ func runHandshakeDemo() {
 // getFlagsString returns a human-readable string representation of TCP flags
 func getFlagsString(header *packet.TCPHeader) string {
 	var flags []string
-	
+
 	if header.HasFlag(packet.FlagSYN) {
 		flags = append(flags, "SYN")
 	}
