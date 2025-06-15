@@ -6,10 +6,98 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/sasakihasuto/tinytcp/internal/packet"
 	"github.com/sasakihasuto/tinytcp/internal/socket"
 )
+
+// RetransmissionEntry represents a packet waiting for acknowledgment
+type RetransmissionEntry struct {
+	Header   *packet.TCPHeader
+	Data     []byte
+	SentTime time.Time
+	Attempts int
+}
+
+// RetransmissionQueue manages packets that need potential retransmission
+type RetransmissionQueue struct {
+	entries []RetransmissionEntry
+	mutex   sync.Mutex
+}
+
+// NewRetransmissionQueue creates a new retransmission queue
+func NewRetransmissionQueue() *RetransmissionQueue {
+	return &RetransmissionQueue{
+		entries: make([]RetransmissionEntry, 0),
+	}
+}
+
+// Add adds a packet to the retransmission queue
+func (rq *RetransmissionQueue) Add(header *packet.TCPHeader, data []byte) {
+	rq.mutex.Lock()
+	defer rq.mutex.Unlock()
+
+	entry := RetransmissionEntry{
+		Header:   header,
+		Data:     data,
+		SentTime: time.Now(),
+		Attempts: 1,
+	}
+	rq.entries = append(rq.entries, entry)
+}
+
+// Remove removes acknowledged packets from the queue
+func (rq *RetransmissionQueue) Remove(ackNumber uint32) {
+	rq.mutex.Lock()
+	defer rq.mutex.Unlock()
+
+	// Remove entries that have been acknowledged
+	newEntries := make([]RetransmissionEntry, 0)
+	for _, entry := range rq.entries {
+		// If the ACK number is greater than the sequence number + data length,
+		// this packet has been acknowledged
+		seqEnd := entry.Header.SequenceNumber + uint32(len(entry.Data))
+		if entry.Header.HasFlag(packet.FlagSYN) || entry.Header.HasFlag(packet.FlagFIN) {
+			seqEnd++ // SYN and FIN consume one sequence number
+		}
+
+		if ackNumber < seqEnd {
+			newEntries = append(newEntries, entry)
+		}
+	}
+	rq.entries = newEntries
+}
+
+// GetTimeoutEntries returns entries that have timed out and need retransmission
+func (rq *RetransmissionQueue) GetTimeoutEntries(timeout time.Duration, maxAttempts int) []RetransmissionEntry {
+	rq.mutex.Lock()
+	defer rq.mutex.Unlock()
+
+	var timeoutEntries []RetransmissionEntry
+	now := time.Now()
+
+	for i := range rq.entries {
+		entry := &rq.entries[i]
+		if now.Sub(entry.SentTime) > timeout && entry.Attempts < maxAttempts {
+			// Update the entry for next potential retransmission
+			entry.SentTime = now
+			entry.Attempts++
+			// Add the updated entry to timeout entries
+			timeoutEntries = append(timeoutEntries, *entry)
+		}
+	}
+
+	return timeoutEntries
+}
+
+// Size returns the number of entries in the queue
+func (rq *RetransmissionQueue) Size() int {
+	rq.mutex.Lock()
+	defer rq.mutex.Unlock()
+	return len(rq.entries)
+}
 
 // TCB (Transmission Control Block) represents the state of a TCP connection
 type TCB struct {
@@ -29,15 +117,23 @@ type TCB struct {
 	// Buffers
 	SendBuffer []byte
 	RecvBuffer []byte
+
+	// Retransmission management
+	RetransmissionQueue       *RetransmissionQueue
+	RetransmissionTimeout     time.Duration
+	MaxRetransmissionAttempts int
 }
 
 // NewTCB creates a new TCP Control Block
 func NewTCB(localAddr, remoteAddr *net.TCPAddr) *TCB {
 	return &TCB{
-		LocalAddr:  localAddr,
-		RemoteAddr: remoteAddr,
-		State:      socket.StateClosed,
-		RecvWindow: 65535, // デフォルトウィンドウサイズ
+		LocalAddr:                 localAddr,
+		RemoteAddr:                remoteAddr,
+		State:                     socket.StateClosed,
+		RecvWindow:                65535, // デフォルトウィンドウサイズ
+		RetransmissionQueue:       NewRetransmissionQueue(),
+		RetransmissionTimeout:     1 * time.Second, // デフォルト1秒
+		MaxRetransmissionAttempts: 3,               // 最大3回再送
 	}
 }
 
@@ -77,6 +173,9 @@ func (h *ThreeWayHandshake) StartClient() (*packet.TCPHeader, error) {
 	synHeader.SequenceNumber = isn
 	synHeader.SetFlag(packet.FlagSYN)
 	synHeader.WindowSize = h.tcb.RecvWindow
+
+	// Add SYN packet to retransmission queue
+	h.tcb.RetransmissionQueue.Add(synHeader, nil)
 
 	// Transition to SYN_SENT state
 	h.tcb.State = socket.StateSynSent
@@ -137,6 +236,9 @@ func (h *ThreeWayHandshake) HandleSynAck(synAckHeader *packet.TCPHeader) (*packe
 	ackHeader.SetFlag(packet.FlagACK)
 	ackHeader.WindowSize = h.tcb.RecvWindow
 
+	// Remove SYN from retransmission queue (it's been acknowledged by SYN-ACK)
+	h.tcb.RetransmissionQueue.Remove(synAckHeader.AckNumber)
+
 	// Connection established
 	h.tcb.State = socket.StateEstablished
 
@@ -158,6 +260,9 @@ func (h *ThreeWayHandshake) HandleAck(ackHeader *packet.TCPHeader) error {
 	if ackHeader.SequenceNumber != h.tcb.RecvNext {
 		return fmt.Errorf("invalid sequence number in final ACK")
 	}
+
+	// Remove SYN-ACK from retransmission queue
+	h.tcb.RetransmissionQueue.Remove(ackHeader.AckNumber)
 
 	// Connection established
 	h.tcb.State = socket.StateEstablished
@@ -215,6 +320,9 @@ func (dt *DataTransfer) Send(data []byte) (*packet.TCPHeader, error) {
 	// データを送信バッファに追加（学習目的のためシンプルに）
 	dt.tcb.SendBuffer = append(dt.tcb.SendBuffer, data...)
 
+	// Add to retransmission queue
+	dt.tcb.RetransmissionQueue.Add(header, data)
+
 	// シーケンス番号を更新（送信データ長分進める）
 	dt.tcb.SendNext += uint32(len(data))
 
@@ -268,6 +376,9 @@ func (dt *DataTransfer) ReceiveAck(header *packet.TCPHeader) error {
 	// 確認済みデータの更新
 	dt.tcb.SendUnack = header.AckNumber
 
+	// Remove acknowledged packets from retransmission queue
+	dt.tcb.RetransmissionQueue.Remove(header.AckNumber)
+
 	return nil
 }
 
@@ -284,6 +395,30 @@ func (dt *DataTransfer) GetReceiveBuffer() []byte {
 // ClearReceiveBuffer clears the receive buffer (after application reads data)
 func (dt *DataTransfer) ClearReceiveBuffer() {
 	dt.tcb.RecvBuffer = dt.tcb.RecvBuffer[:0]
+}
+
+// CheckRetransmissions checks for packets that need retransmission
+func (dt *DataTransfer) CheckRetransmissions() ([]RetransmissionEntry, error) {
+	timeoutEntries := dt.tcb.RetransmissionQueue.GetTimeoutEntries(
+		dt.tcb.RetransmissionTimeout,
+		dt.tcb.MaxRetransmissionAttempts,
+	)
+	return timeoutEntries, nil
+}
+
+// GetRetransmissionQueueSize returns the current size of retransmission queue
+func (dt *DataTransfer) GetRetransmissionQueueSize() int {
+	return dt.tcb.RetransmissionQueue.Size()
+}
+
+// SetRetransmissionTimeout sets the retransmission timeout
+func (dt *DataTransfer) SetRetransmissionTimeout(timeout time.Duration) {
+	dt.tcb.RetransmissionTimeout = timeout
+}
+
+// SetMaxRetransmissionAttempts sets the maximum number of retransmission attempts
+func (dt *DataTransfer) SetMaxRetransmissionAttempts(maxAttempts int) {
+	dt.tcb.MaxRetransmissionAttempts = maxAttempts
 }
 
 // FourWayHandshake handles the TCP four-way handshake process for connection termination
@@ -311,6 +446,9 @@ func (h *FourWayHandshake) Close() (*packet.TCPHeader, error) {
 	finHeader.AckNumber = h.tcb.RecvNext
 	finHeader.SetFlag(packet.FlagFIN | packet.FlagACK)
 	finHeader.WindowSize = h.tcb.RecvWindow
+
+	// Add FIN packet to retransmission queue
+	h.tcb.RetransmissionQueue.Add(finHeader, nil)
 
 	// Update sequence number (FIN consumes one sequence number)
 	h.tcb.SendNext++
